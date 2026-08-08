@@ -7,28 +7,27 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 # ============================= CONFIG (edit these) =============================
-TOP_N = 50                     # how many tokens to scan
-UNIVERSE_MODE = "volume"       # "volume" (top by 24h quote volume) or "trending" (top 24h movers)
-TIMEFRAMES = ["15m", "1h"]     # which timeframes to check every run, e.g. add "4h", "1d"
-KLINES_LIMIT = 300             # candles fetched per symbol/timeframe (enough to warm up the 200EMA)
-MAX_WORKERS = 8                # concurrent Binance requests
-STATE_FILE = "state.json"      # tracks already-notified signals so you don't get duplicates
-STATE_MAX_AGE_DAYS = 3         # prune dedup entries older than this
+TOP_N = 50
+UNIVERSE_MODE = "volume"
+TIMEFRAMES = ["15m", "1h"]
+KLINES_LIMIT = 300
+MAX_WORKERS = 8
+STATE_FILE = "state.json"
+STATE_MAX_AGE_DAYS = 3
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 STABLE_BASES = {"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "PAX",
                 "EUR", "GBP", "TRY", "BRL", "UST", "USTC", "PYUSD", "AEUR"}
-BINANCE = "https://api.binance.com"
 BINANCE_PROXIES = [
-    "https://api.binance.com",  # Direct (primary)
-    "https://api.codetabs.com/v1/proxy?url=https://api.binance.com",  # Free CORS proxy #1
-    "https://cors.sh/https://api.binance.com",  # Free CORS proxy #2
+    "https://api.binance.com",
+    "https://api.codetabs.com/v1/proxy?url=https://api.binance.com",
+    "https://cors.sh/https://api.binance.com",
 ]
 
 
-# ============================= INDICATORS (same math as the screener/backtester) =============================
+# ============================= INDICATORS =============================
 def ema(values, period):
     n = len(values)
     out = [None] * n
@@ -138,8 +137,6 @@ def fetch_top_symbols(limit, mode):
     return rows[:limit]
 
 
-const INTERVAL_MS = {'15m':15*60000, '30m':30*60000, '1h':3600000, '4h':4*3600000, '1d':86400000}
-
 def fetch_klines(symbol, interval, limit):
     last_err = None
     for proxy_base in BINANCE_PROXIES:
@@ -167,33 +164,7 @@ def fetch_klines(symbol, interval, limit):
     }
 
 
-def runWithConcurrency(items, worker, concurrency, onProgress):
-    idx = 0
-    done = 0
-    results = [None] * len(items)
-    
-    def next_worker():
-        nonlocal idx, done
-        while idx < len(items):
-            my = idx
-            idx += 1
-            try:
-                results[my] = worker(items[my])
-            except Exception as e:
-                results[my] = {**items[my], "error": str(e)}
-            done += 1
-            if onProgress:
-                onProgress(done, len(items))
-    
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=min(concurrency, len(items))) as ex:
-        workers = [ex.submit(next_worker) for _ in range(min(concurrency, len(items)))]
-        for w in workers:
-            w.result()
-    return results
-
-
-# ============================= TRADE SIMULATION =============================
+# ============================= STRATEGY CHECK =============================
 def check_signal(k):
     closes, highs, lows = k["closes"], k["highs"], k["lows"]
     n = len(closes)
@@ -274,35 +245,18 @@ def main():
     jobs = [(s["symbol"], tf) for s in symbols for tf in TIMEFRAMES]
     found = []
 
-    def worker(job):
-        symbol, tf = job
-        try:
-            k = fetch_klines(symbol, tf, KLINES_LIMIT)
-            return symbol, tf, check_signal(k), None
-        except Exception as e:
-            return symbol, tf, None, str(e)
-
-    def progress(done, total):
-        print(f"Scanned {done}/{total}...")
-
-    results = []
     for symbol, tf in jobs:
         try:
             k = fetch_klines(symbol, tf, KLINES_LIMIT)
             sig = check_signal(k)
-            results.append((symbol, tf, sig, None))
+            if sig:
+                key = f"{symbol}:{tf}:{sig['candle_open_time']}"
+                if key not in state:
+                    state[key] = time.time() * 1000
+                    found.append((symbol, tf, sig))
         except Exception as e:
-            results.append((symbol, tf, None, str(e)))
+            print(f"Error scanning {symbol}/{tf}: {e}")
             continue
-
-    for symbol, tf, sig, err in results:
-        if err or not sig:
-            continue
-        key = f"{symbol}:{tf}:{sig['candle_open_time']}"
-        if key in state:
-            continue
-        state[key] = time.time() * 1000
-        found.append((symbol, tf, sig))
 
     for symbol, tf, sig in found:
         risk_pct = (sig["entry"] - sig["stop"]) / sig["entry"] * 100
