@@ -21,6 +21,11 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 STABLE_BASES = {"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "PAX",
                 "EUR", "GBP", "TRY", "BRL", "UST", "USTC", "PYUSD", "AEUR"}
 BINANCE = "https://api.binance.com"
+BINANCE_PROXIES = [
+    "https://api.binance.com",  # Direct (primary)
+    "https://api.codetabs.com/v1/proxy?url=https://api.binance.com",  # Free CORS proxy #1
+    "https://cors.sh/https://api.binance.com",  # Free CORS proxy #2
+]
 
 
 # ============================= INDICATORS (same math as the screener/backtester) =============================
@@ -103,9 +108,20 @@ def is_eligible(symbol):
 
 
 def fetch_top_symbols(limit, mode):
-    r = requests.get(f"{BINANCE}/api/v3/ticker/24hr", timeout=15)
-    r.raise_for_status()
-    data = r.json()
+    last_err = None
+    for proxy_base in BINANCE_PROXIES:
+        try:
+            url = f"{proxy_base}/api/v3/ticker/24hr"
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            break
+        except Exception as e:
+            last_err = e
+            continue
+    else:
+        raise Exception(f"All Binance API proxies failed. Last error: {last_err}")
+
     rows = [{
         "symbol": t["symbol"],
         "quoteVolume": float(t["quoteVolume"]),
@@ -122,12 +138,25 @@ def fetch_top_symbols(limit, mode):
     return rows[:limit]
 
 
+const INTERVAL_MS = {'15m':15*60000, '30m':30*60000, '1h':3600000, '4h':4*3600000, '1d':86400000}
+
 def fetch_klines(symbol, interval, limit):
-    r = requests.get(f"{BINANCE}/api/v3/klines",
-                      params={"symbol": symbol, "interval": interval, "limit": limit},
-                      timeout=15)
-    r.raise_for_status()
-    raw = r.json()
+    last_err = None
+    for proxy_base in BINANCE_PROXIES:
+        try:
+            url = f"{proxy_base}/api/v3/klines"
+            r = requests.get(url,
+                              params={"symbol": symbol, "interval": interval, "limit": limit},
+                              timeout=15)
+            r.raise_for_status()
+            raw = r.json()
+            break
+        except Exception as e:
+            last_err = e
+            continue
+    else:
+        raise Exception(f"fetch_klines failed for {symbol}/{interval}. Last error: {last_err}")
+
     now_ms = time.time() * 1000
     closed = [k for k in raw if k[6] < now_ms]
     return {
@@ -138,7 +167,33 @@ def fetch_klines(symbol, interval, limit):
     }
 
 
-# ============================= STRATEGY CHECK (strict same-candle rule, last closed candle only) =============================
+def runWithConcurrency(items, worker, concurrency, onProgress):
+    idx = 0
+    done = 0
+    results = [None] * len(items)
+    
+    def next_worker():
+        nonlocal idx, done
+        while idx < len(items):
+            my = idx
+            idx += 1
+            try:
+                results[my] = worker(items[my])
+            except Exception as e:
+                results[my] = {**items[my], "error": str(e)}
+            done += 1
+            if onProgress:
+                onProgress(done, len(items))
+    
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(concurrency, len(items))) as ex:
+        workers = [ex.submit(next_worker) for _ in range(min(concurrency, len(items)))]
+        for w in workers:
+            w.result()
+    return results
+
+
+# ============================= TRADE SIMULATION =============================
 def check_signal(k):
     closes, highs, lows = k["closes"], k["highs"], k["lows"]
     n = len(closes)
@@ -227,15 +282,27 @@ def main():
         except Exception as e:
             return symbol, tf, None, str(e)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for symbol, tf, sig, err in ex.map(worker, jobs):
-            if err or not sig:
-                continue
-            key = f"{symbol}:{tf}:{sig['candle_open_time']}"
-            if key in state:
-                continue
-            state[key] = time.time() * 1000
-            found.append((symbol, tf, sig))
+    def progress(done, total):
+        print(f"Scanned {done}/{total}...")
+
+    results = []
+    for symbol, tf in jobs:
+        try:
+            k = fetch_klines(symbol, tf, KLINES_LIMIT)
+            sig = check_signal(k)
+            results.append((symbol, tf, sig, None))
+        except Exception as e:
+            results.append((symbol, tf, None, str(e)))
+            continue
+
+    for symbol, tf, sig, err in results:
+        if err or not sig:
+            continue
+        key = f"{symbol}:{tf}:{sig['candle_open_time']}"
+        if key in state:
+            continue
+        state[key] = time.time() * 1000
+        found.append((symbol, tf, sig))
 
     for symbol, tf, sig in found:
         risk_pct = (sig["entry"] - sig["stop"]) / sig["entry"] * 100
